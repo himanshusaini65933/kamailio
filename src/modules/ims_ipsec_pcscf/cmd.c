@@ -398,17 +398,22 @@ static int update_contact_ipsec_params(ipsec_t* s, const struct sip_msg* m, ipse
         return -1;
     }
 
-    if((s->port_pc = acquire_cport()) == 0){
-        LM_ERR("No free client port for IPSEC tunnel creation\n");
-		shm_free(s->ck.s);
-		s->ck.s = NULL; s->ck.len = 0;
-		shm_free(s->ik.s);
-		s->ik.s = NULL; s->ik.len = 0;
+	// use the same P-CSCF client port if it is present
+	if(s_old){
+		s->port_pc = s_old->port_pc;
+	}else{
+		if((s->port_pc = acquire_cport()) == 0){
+			LM_ERR("No free client port for IPSEC tunnel creation\n");
+			shm_free(s->ck.s);
+			s->ck.s = NULL; s->ck.len = 0;
+			shm_free(s->ik.s);
+			s->ik.s = NULL; s->ik.len = 0;
 
-		release_spi(s->spi_pc);
-		release_spi(s->spi_ps);
-        return -1;
-    }
+			release_spi(s->spi_pc);
+			release_spi(s->spi_ps);
+			return -1;
+		}
+	}
 
 	// use the same P-CSCF server port if it is present
 	if(s_old){
@@ -491,7 +496,7 @@ static int create_ipsec_tunnel(const struct ip_addr *remote_addr, ipsec_t* s)
     return 0;
 }
 
-static int destroy_ipsec_tunnel(str remote_addr, ipsec_t* s, unsigned short received_port)
+static int destroy_ipsec_tunnel(str remote_addr, ipsec_t* s, unsigned short received_port, int release_proxy_ports)
 {
     struct mnl_socket* sock = init_mnl_socket();
     if (sock == NULL) {
@@ -538,9 +543,11 @@ static int destroy_ipsec_tunnel(str remote_addr, ipsec_t* s, unsigned short rece
     release_spi(s->spi_pc);
     release_spi(s->spi_ps);
 
-    // Release the client and the server ports
-    release_cport(s->port_pc);
-    release_sport(s->port_ps);
+    if (release_proxy_ports) {
+        // Release the client and the server ports
+        release_cport(s->port_pc);
+        release_sport(s->port_ps);
+    }
 
     close_mnl_socket(sock);
     return 0;
@@ -565,7 +572,7 @@ void ipsec_on_expire(struct pcontact *c, int type, void *param)
         return;
     }
 
-    destroy_ipsec_tunnel(c->received_host, c->security_temp->data.ipsec, c->contact_port);
+    destroy_ipsec_tunnel(c->received_host, c->security_temp->data.ipsec, c->contact_port, 1);
 }
 
 int add_supported_secagree_header(struct sip_msg* m)
@@ -740,9 +747,14 @@ int ipsec_create(struct sip_msg* m, udomain_t* d, int _cflags)
             sec_params->data.ipsec->spi_uc != pcontact->security_temp->data.ipsec->spi_uc ||
             sec_params->data.ipsec->spi_us != pcontact->security_temp->data.ipsec->spi_us) {
 
-            // Backup the Proxy Server port
+            // Backup the Proxy Server and Client port - we re-use them
             ipsec_t ipsec_ps;
             ipsec_ps.port_ps = pcontact->security_temp->data.ipsec->port_ps;
+            ipsec_ps.port_pc = pcontact->security_temp->data.ipsec->port_pc;
+
+            // Destroy privously existing IPSec tunnels but dont release proxy ports
+            destroy_ipsec_tunnel(ci.received_host,
+                pcontact->security_temp->data.ipsec, pcontact->contact_port, 0);
 
             if(pcontact->security_temp->sec_header.s)
                 shm_free(pcontact->security_temp->sec_header.s);
@@ -776,7 +788,7 @@ int ipsec_create(struct sip_msg* m, udomain_t* d, int _cflags)
 
             s = pcontact->security_temp->data.ipsec;
 
-            // Restore the backed up Proxy Server port
+            // Restore the backed up Proxy Server and Client port
             if(update_contact_ipsec_params(s, m, &ipsec_ps) != 0) {
                 goto cleanup;
             }
@@ -833,6 +845,10 @@ int ipsec_create(struct sip_msg* m, udomain_t* d, int _cflags)
         if(update_contact_ipsec_params(req_sec_params->data.ipsec, m, ipsec_reuse_server_port ? pcontact->security_temp->data.ipsec : NULL) != 0) {
             goto cleanup;
         }
+
+        // Restore Proxy Server and Client port
+        req_sec_params->data.ipsec->port_ps = pcontact->security_temp->data.ipsec->port_ps;
+        req_sec_params->data.ipsec->port_pc = pcontact->security_temp->data.ipsec->port_pc;
 
         if(create_ipsec_tunnel(&req->rcv.src_ip, req_sec_params->data.ipsec) != 0){
             goto cleanup;
@@ -1070,9 +1086,7 @@ int ipsec_destroy(struct sip_msg* m, udomain_t* d)
         goto cleanup;
     }
 
-    destroy_ipsec_tunnel(ci.received_host, pcontact->security_temp->data.ipsec, pcontact->contact_port);
-
-    ipsec_reconfig();
+    destroy_ipsec_tunnel(ci.received_host, pcontact->security_temp->data.ipsec, pcontact->contact_port, 1);
 
     ret = IPSEC_CMD_SUCCESS;    // all good, set ret to SUCCESS, and exit
 
@@ -1131,9 +1145,7 @@ int ipsec_destroy_by_contact(udomain_t* _d, str * uri, str * received_host, int 
         goto cleanup;
     }
 
-    destroy_ipsec_tunnel(search_ci.received_host, pcontact->security_temp->data.ipsec, pcontact->contact_port);
-
-    ipsec_reconfig();
+    destroy_ipsec_tunnel(search_ci.received_host, pcontact->security_temp->data.ipsec, pcontact->contact_port, 1);
 
     ret = IPSEC_CMD_SUCCESS;    // all good, set ret to SUCCESS, and exit
 
