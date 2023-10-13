@@ -82,6 +82,24 @@ extern struct tm_binds tmb;
 
 #define IPSEC_CREATE_DELETE_UNUSED_TUNNELS	0x01 /* if set - delete unused tunnels before every registration */
 
+static int pv_t_copy_msg(struct sip_msg *src, struct sip_msg *dst)
+{
+        dst->id = src->id;
+        dst->rcv = src->rcv;
+        dst->set_global_address = src->set_global_address;
+        dst->set_global_port = src->set_global_port;
+        dst->flags = src->flags;
+        dst->fwd_send_flags = src->fwd_send_flags;
+        dst->rpl_send_flags = src->rpl_send_flags;
+        dst->force_send_socket = src->force_send_socket;
+
+        if (parse_msg(dst->buf, dst->len, dst) != 0) {
+                LM_ERR("parse msg failed\n");
+                return -1;
+        }
+        return 0;
+}
+
 int bind_ipsec_pcscf(ipsec_pcscf_api_t* api) {
 	if(!api){
 		LM_ERR("invalid parameter value\n");
@@ -146,6 +164,8 @@ static int fill_contact(struct pcontact_info* ci, struct sip_msg* m, tm_cell_t *
     struct via_body* vb = NULL;
     struct sip_msg* req = NULL;
 	char* srcip = NULL;
+    str aor, f_uri;
+    int i = 0;
 
     if(!ci) {
         LM_ERR("called with null ptr\n");
@@ -170,8 +190,16 @@ static int fill_contact(struct pcontact_info* ci, struct sip_msg* m, tm_cell_t *
         ci->via_host = uri.host;
         ci->via_port = uri.port_no ? uri.port_no : 5060;
         ci->via_prot = 0;
-        ci->aor = m->first_line.u.request.uri;
+        //ci->aor = m->first_line.u.request.uri;
         ci->searchflag = SEARCH_NORMAL;
+
+        aor.s = pkg_malloc(m->first_line.u.request.uri.len);
+        if (aor.s == NULL) {
+            LM_ERR("memory allocation failure\n");
+            return -1;
+        }
+        memcpy(aor.s, m->first_line.u.request.uri.s, m->first_line.u.request.uri.len);
+        aor.len = m->first_line.u.request.uri.len;
 
 		if(ci->via_host.s == NULL || ci->via_host.len == 0){
 			// no host included in RURI
@@ -251,15 +279,37 @@ static int fill_contact(struct pcontact_info* ci, struct sip_msg* m, tm_cell_t *
 
         req = t->uas.request;
 
-        cb = cscf_parse_contacts(req);
-        if (!cb || (!cb->contacts)) {
-            LM_ERR("Reply No contact headers\n");
+        /* Do not use t->uas.request for getting contacts - it has garbage */
+        struct sip_msg req_msg;
+        memset(&req_msg, 0, sizeof(struct sip_msg));
+        req_msg.buf =
+            (char*) pkg_malloc((t->uas.request->len + 1) * sizeof(char));
+        memcpy(req_msg.buf, t->uas.request->buf, t->uas.request->len);
+        req_msg.buf[t->uas.request->len] = '\0';
+        req_msg.len = t->uas.request->len;
+        if (pv_t_copy_msg(t->uas.request, &req_msg) != 0) {
+            pkg_free(req_msg.buf);
+            req_msg.buf = NULL;
             return -1;
+        }
+        if (req_msg.contact && ((contact_body_t *) req_msg.contact->parsed)) {
+            free_contact((contact_body_t **) &req_msg.contact->parsed);
+        }
+
+        cb = cscf_parse_contacts(&req_msg);
+        if (!cb || (!cb->contacts)) {
+            LM_ERR("Reply No contact headers. Will try with request's From URI\n");
+            if (!cscf_get_from_uri(&req_msg, &f_uri)) {
+                LM_INFO("From URI in request <%.*s>\n", f_uri.len, f_uri.s);
+                pkg_free(req_msg.buf);
+                return -1;
+            }
         }
 
         vb = cscf_get_ue_via(m);
         if (!vb) {
             LM_ERR("Reply No via body headers\n");
+            pkg_free(req_msg.buf);
             return -1;
         }
 
@@ -267,8 +317,17 @@ static int fill_contact(struct pcontact_info* ci, struct sip_msg* m, tm_cell_t *
         ci->via_host = vb->host;
         ci->via_port = vb->port;
         ci->via_prot = vb->proto;
-        ci->aor = cb->contacts->uri;
+        //ci->aor = cb->contacts->uri;
         ci->searchflag = SEARCH_RECEIVED;
+
+        aor.s = pkg_malloc((cb && cb->contacts) ? cb->contacts->uri.len : f_uri.len);
+        if (aor.s == NULL) {
+            LM_ERR("memory allocation failure\n");
+            pkg_free(req_msg.buf);
+            return -1;
+        }
+        memcpy(aor.s, (cb && cb->contacts) ? cb->contacts->uri.s : f_uri.s, (cb && cb->contacts) ? cb->contacts->uri.len : f_uri.len);
+        aor.len = (cb && cb->contacts) ? cb->contacts->uri.len : f_uri.len;
 
 		if((srcip = pkg_malloc(50)) == NULL) {
 			LM_ERR("Error allocating memory for source IP address\n");
@@ -279,11 +338,22 @@ static int fill_contact(struct pcontact_info* ci, struct sip_msg* m, tm_cell_t *
 		ci->received_host.s = srcip;
 		ci->received_port = req->rcv.src_port;
 		ci->received_proto = req->rcv.proto;
+
+        pkg_free(req_msg.buf);
     }
     else {
         LM_ERR("Unknown first line type: %d\n", m->first_line.type);
         return -1;
     }
+
+    for (i = 4; i < aor.len; i++)
+        if (aor.s[i] == ';') {
+            aor.len = i;
+            break;
+        }
+
+    LM_DBG("AOR <%.*s>\n", aor.len, aor.s);
+    ci->aor = aor;
 
     LM_DBG("SIP %s fill contact with AOR [%.*s], VIA [%d://%.*s:%d], received_host [%d://%.*s:%d]\n",
             m->first_line.type == SIP_REQUEST ? "REQUEST" : "REPLY",
@@ -371,17 +441,22 @@ static int update_contact_ipsec_params(ipsec_t* s, const struct sip_msg* m, ipse
         return -1;
     }
 
-    if((s->port_pc = acquire_cport()) == 0){
-        LM_ERR("No free client port for IPSEC tunnel creation\n");
-		shm_free(s->ck.s);
-		s->ck.s = NULL; s->ck.len = 0;
-		shm_free(s->ik.s);
-		s->ik.s = NULL; s->ik.len = 0;
+	// use the same P-CSCF client port if it is present
+	if(s_old){
+		s->port_pc = s_old->port_pc;
+	}else{
+		if((s->port_pc = acquire_cport()) == 0){
+			LM_ERR("No free client port for IPSEC tunnel creation\n");
+			shm_free(s->ck.s);
+			s->ck.s = NULL; s->ck.len = 0;
+			shm_free(s->ik.s);
+			s->ik.s = NULL; s->ik.len = 0;
 
-		release_spi(s->spi_pc);
-		release_spi(s->spi_ps);
-        return -1;
-    }
+			release_spi(s->spi_pc);
+			release_spi(s->spi_ps);
+			return -1;
+		}
+	}
 
 	// use the same P-CSCF server port if it is present
 	if(s_old){
@@ -394,7 +469,7 @@ static int update_contact_ipsec_params(ipsec_t* s, const struct sip_msg* m, ipse
 			shm_free(s->ik.s);
 			s->ik.s = NULL; s->ik.len = 0;
 
-			release_cport(s->port_pc);
+			// release_cport(s->port_pc);
 
 			release_spi(s->spi_pc);
 			release_spi(s->spi_ps);
@@ -459,12 +534,34 @@ static int create_ipsec_tunnel(const struct ip_addr *remote_addr, ipsec_t* s)
     add_sa    (sock, remote_addr, ipsec_addr, s->port_us, s->port_pc, s->spi_pc, s->ck, s->ik, s->r_alg, s->r_ealg);
     add_policy(sock, remote_addr, ipsec_addr, s->port_us, s->port_pc, s->spi_pc, IPSEC_POLICY_DIRECTION_IN);
 
+    /* Fix for some broken In-Dialog routing */
+
+    // SA5 UE client to P-CSCF client
+    //               src adrr     dst addr     src port    dst port
+    add_sa    (sock, remote_addr, ipsec_addr, s->port_uc, s->port_pc, s->spi_ps, s->ck, s->ik, s->r_alg, s->r_ealg);
+    add_policy(sock, remote_addr, ipsec_addr, s->port_uc, s->port_pc, s->spi_ps, IPSEC_POLICY_DIRECTION_IN);
+
+    // SA6 P-CSCF client to UE client
+    //               src adrr     dst addr     src port    dst port
+    add_sa    (sock, ipsec_addr, remote_addr, s->port_pc, s->port_uc, s->spi_us, s->ck, s->ik, s->r_alg, s->r_ealg);
+    add_policy(sock, ipsec_addr, remote_addr, s->port_pc, s->port_uc, s->spi_us, IPSEC_POLICY_DIRECTION_OUT);
+
+    // SA7 P-CSCF server to UE server
+    //               src adrr     dst addr     src port    dst port
+    add_sa    (sock, ipsec_addr, remote_addr, s->port_ps, s->port_us, s->spi_uc, s->ck, s->ik, s->r_alg, s->r_ealg);
+    add_policy(sock, ipsec_addr, remote_addr, s->port_ps, s->port_us, s->spi_uc, IPSEC_POLICY_DIRECTION_OUT);
+
+    // SA8 UE server to P-CSCF server
+    //               src adrr     dst addr     src port    dst port
+    add_sa    (sock, remote_addr, ipsec_addr, s->port_us, s->port_ps, s->spi_pc, s->ck, s->ik, s->r_alg, s->r_ealg);
+    add_policy(sock, remote_addr, ipsec_addr, s->port_us, s->port_ps, s->spi_pc, IPSEC_POLICY_DIRECTION_IN);
+
     close_mnl_socket(sock);
 
     return 0;
 }
 
-static int destroy_ipsec_tunnel(str remote_addr, ipsec_t* s, unsigned short received_port)
+static int destroy_ipsec_tunnel(str remote_addr, ipsec_t* s, unsigned short received_port, int release_proxy_ports)
 {
     struct mnl_socket* sock = init_mnl_socket();
     if (sock == NULL) {
@@ -507,13 +604,34 @@ static int destroy_ipsec_tunnel(str remote_addr, ipsec_t* s, unsigned short rece
     remove_sa    (sock, remote_addr, ipsec_addr, s->port_us, s->port_pc, s->spi_pc, ip_addr.af);
     remove_policy(sock, remote_addr, ipsec_addr, s->port_us, s->port_pc, s->spi_pc, ip_addr.af, IPSEC_POLICY_DIRECTION_IN);
 
+    /* Fix for some broken In-Dialog routing */
+
+    // SA5 UE client to P-CSCF client
+    remove_sa    (sock, remote_addr, ipsec_addr, s->port_uc, s->port_pc, s->spi_ps, ip_addr.af);
+    remove_policy(sock, remote_addr, ipsec_addr, s->port_uc, s->port_pc, s->spi_ps, ip_addr.af, IPSEC_POLICY_DIRECTION_IN);
+
+    // SA6 P-CSCF client to UE client
+    remove_sa    (sock, ipsec_addr, remote_addr, s->port_pc, s->port_uc, s->spi_us, ip_addr.af);
+    remove_policy(sock, ipsec_addr, remote_addr, s->port_pc, s->port_uc, s->spi_us, ip_addr.af, IPSEC_POLICY_DIRECTION_OUT);
+
+    // SA7 P-CSCF server to UE server
+    remove_sa    (sock, ipsec_addr, remote_addr, s->port_ps, s->port_us, s->spi_uc, ip_addr.af);
+    remove_policy(sock, ipsec_addr, remote_addr, s->port_ps, s->port_us, s->spi_uc, ip_addr.af, IPSEC_POLICY_DIRECTION_OUT);
+
+    // SA8 UE server to P-CSCF server
+    remove_sa    (sock, remote_addr, ipsec_addr, s->port_us, s->port_ps, s->spi_pc, ip_addr.af);
+    remove_policy(sock, remote_addr, ipsec_addr, s->port_us, s->port_ps, s->spi_pc, ip_addr.af, IPSEC_POLICY_DIRECTION_IN);
+
     // Release SPIs
     release_spi(s->spi_pc);
     release_spi(s->spi_ps);
 
-    // Release the client and the server ports
-    release_cport(s->port_pc);
-    release_sport(s->port_ps);
+    if (release_proxy_ports) {
+        // Release the client and the server ports
+        // Do not release proxy IPSec ports at all just remove SA and Policies
+        // release_cport(s->port_pc);
+        // release_sport(s->port_ps);
+    }
 
     close_mnl_socket(sock);
     return 0;
@@ -538,7 +656,7 @@ void ipsec_on_expire(struct pcontact *c, int type, void *param)
         return;
     }
 
-    destroy_ipsec_tunnel(c->received_host, c->security_temp->data.ipsec, c->contact_port);
+    destroy_ipsec_tunnel(c->received_host, c->security_temp->data.ipsec, c->contact_port, 1);
 }
 
 int add_supported_secagree_header(struct sip_msg* m)
@@ -618,7 +736,7 @@ int add_security_server_header(struct sip_msg* m, ipsec_t* s)
     char sec_hdr_buf[1024];
     memset(sec_hdr_buf, 0, sizeof(sec_hdr_buf));
     sec_header->len = snprintf(sec_hdr_buf, sizeof(sec_hdr_buf) - 1,
-                                "Security-Server: ipsec-3gpp;prot=esp;mod=trans;spi-c=%d;spi-s=%d;port-c=%d;port-s=%d;alg=%.*s;ealg=%.*s\r\n",
+                                "Security-Server: ipsec-3gpp;q=0.1;prot=esp;mod=trans;spi-c=%d;spi-s=%d;port-c=%d;port-s=%d;alg=%.*s;ealg=%.*s\r\n",
                                 s->spi_pc, s->spi_ps, s->port_pc, s->port_ps,
                                 s->r_alg.len, s->r_alg.s,
                                 s->r_ealg.len, s->r_ealg.s
@@ -693,16 +811,81 @@ int ipsec_create(struct sip_msg* m, udomain_t* d, int _cflags)
     struct sip_msg* req = t->uas.request;
 
     // Update contacts only for initial registration, for re-registration the existing contacts shouldn't be updated.
-    if(ci.via_port == SIP_PORT){
+    if((ci.via_port == SIP_PORT) ||
+        (pcontact->security_temp->data.ipsec->port_ps == 0  &&
+        pcontact->security_temp->data.ipsec->port_pc == 0)){
         LM_DBG("Registration for contact with AOR [%.*s], VIA [%d://%.*s:%d], received_host [%d://%.*s:%d]\n",
                 ci.aor.len, ci.aor.s, ci.via_prot, ci.via_host.len, ci.via_host.s, ci.via_port,
                 ci.received_proto, ci.received_host.len, ci.received_host.s, ci.received_port);
 
-        ipsec_t* s = pcontact->security_temp->data.ipsec;
+        //ipsec_t* s = pcontact->security_temp->data.ipsec;
+        ipsec_t* s = NULL;
+        security_t* sec_params = NULL;
 
-		// for initial Registration use a new P-CSCF server port
-        if(update_contact_ipsec_params(s, m, NULL) != 0) {
+        // Parse security parameters from the REGISTER request and get some data for the tunnels
+        if((sec_params = cscf_get_security(req)) == NULL) {
+            LM_CRIT("No security parameters in REGISTER request\n");
             goto cleanup;
+        }
+
+        if (sec_params->data.ipsec->port_uc != pcontact->security_temp->data.ipsec->port_uc ||
+            sec_params->data.ipsec->port_us != pcontact->security_temp->data.ipsec->port_us ||
+            sec_params->data.ipsec->spi_uc != pcontact->security_temp->data.ipsec->spi_uc ||
+            sec_params->data.ipsec->spi_us != pcontact->security_temp->data.ipsec->spi_us) {
+
+            // Backup the Proxy Server and Client port - we re-use them
+            ipsec_t ipsec_ps;
+            ipsec_ps.port_ps = pcontact->security_temp->data.ipsec->port_ps;
+            ipsec_ps.port_pc = pcontact->security_temp->data.ipsec->port_pc;
+
+            // Destroy privously existing IPSec tunnels but dont release proxy ports
+            destroy_ipsec_tunnel(ci.received_host,
+                pcontact->security_temp->data.ipsec, pcontact->contact_port, 0);
+
+            if(pcontact->security_temp->sec_header.s)
+                shm_free(pcontact->security_temp->sec_header.s);
+
+            if(pcontact->security_temp->data.ipsec){
+                if(pcontact->security_temp->data.ipsec->ealg.s)
+                    shm_free(pcontact->security_temp->data.ipsec->ealg.s);
+                if(pcontact->security_temp->data.ipsec->r_ealg.s)
+                    shm_free(pcontact->security_temp->data.ipsec->r_ealg.s);
+                if(pcontact->security_temp->data.ipsec->ck.s)
+                    shm_free(pcontact->security_temp->data.ipsec->ck.s);
+                if(pcontact->security_temp->data.ipsec->alg.s)
+                    shm_free(pcontact->security_temp->data.ipsec->alg.s);
+                if(pcontact->security_temp->data.ipsec->r_alg.s)
+                    shm_free(pcontact->security_temp->data.ipsec->r_alg.s);
+                if(pcontact->security_temp->data.ipsec->ik.s)
+                    shm_free(pcontact->security_temp->data.ipsec->ik.s);
+                if(pcontact->security_temp->data.ipsec->prot.s)
+                    shm_free(pcontact->security_temp->data.ipsec->prot.s);
+                if(pcontact->security_temp->data.ipsec->mod.s)
+                    shm_free(pcontact->security_temp->data.ipsec->mod.s);
+
+                shm_free(pcontact->security_temp->data.ipsec);
+            }
+            shm_free(pcontact->security_temp);
+
+            if(ul.update_temp_security(d, sec_params->type, sec_params, pcontact) != 0){
+                LM_ERR("Error updating temp security\n");
+                goto cleanup;
+            }
+
+            s = pcontact->security_temp->data.ipsec;
+
+            // Restore the backed up Proxy Server and Client port
+            if(update_contact_ipsec_params(s, m, &ipsec_ps) != 0) {
+                goto cleanup;
+            }
+        } else {
+
+            s = pcontact->security_temp->data.ipsec;
+
+            // for initial Registration use a new P-CSCF server port
+            if(update_contact_ipsec_params(s, m, NULL) != 0) {
+                goto cleanup;
+            }
         }
 
         if(create_ipsec_tunnel(&req->rcv.src_ip, s) != 0){
@@ -749,6 +932,10 @@ int ipsec_create(struct sip_msg* m, udomain_t* d, int _cflags)
             goto cleanup;
         }
 
+        // Restore Proxy Server and Client port
+        req_sec_params->data.ipsec->port_ps = pcontact->security_temp->data.ipsec->port_ps;
+        req_sec_params->data.ipsec->port_pc = pcontact->security_temp->data.ipsec->port_pc;
+
         if(create_ipsec_tunnel(&req->rcv.src_ip, req_sec_params->data.ipsec) != 0){
             goto cleanup;
         }
@@ -784,13 +971,14 @@ int ipsec_forward(struct sip_msg* m, udomain_t* d, int _cflags)
     unsigned short dst_port = 0;
     unsigned short src_port = 0;
     ip_addr_t via_host;
+    struct via_body *vb;
     struct sip_msg* req = NULL;
     struct cell *t = NULL;
 
     if(m->first_line.type == SIP_REPLY) {
         // Get request from reply
         t = tmb.t_gett();
-        if (!t) {
+        if (!t || t == (void*) -1) {
             LM_ERR("Error getting transaction\n");
             return ret;
         }
@@ -843,22 +1031,33 @@ int ipsec_forward(struct sip_msg* m, udomain_t* d, int _cflags)
     //    from URI
     //int uri_len = 4 /* strlen("sip:") */ + ci.via_host.len + 5 /* max len of port number */ ;
 
-    if(m->dst_uri.s) {
-        pkg_free(m->dst_uri.s);
-        m->dst_uri.s = NULL;
-        m->dst_uri.len = 0;
-    }
+    vb = cscf_get_last_via(m);
 
     char buf[1024];
     if(m->first_line.type == SIP_REPLY){
-        // for Reply get the dest proto from the received request
-        dst_proto = req->rcv.proto;
+        dst_proto = vb ? vb->proto : req->rcv.proto;
+
+        // As per ETSI TS 133 203 V11.2.0, 7.1 Security association parameters
+        // https://tools.ietf.org/html/rfc3261#section-18
 
         // for Reply and TCP sends from P-CSCF server port, for Reply and UDP sends from P-CSCF client port
-        src_port = dst_proto == PROTO_TCP ? s->port_ps : s->port_pc;
+        // src_port = dst_proto == PROTO_TCP ? s->port_ps : s->port_pc;
 
         // for Reply and TCP sends to UE client port, for Reply and UDP sends to UE server port
-        dst_port = dst_proto == PROTO_TCP ? s->port_uc : s->port_us;
+        // dst_port = dst_proto == PROTO_TCP ? s->port_uc : s->port_us;
+
+        // From Reply and TCP send via the same ports Request was recevied.
+        if (dst_proto == PROTO_TCP) {
+            src_port = req->rcv.dst_port;
+            dst_port = req->rcv.src_port;
+        } else {
+            src_port =  s->port_pc;
+            if (vb && ((vb->port == s->port_uc) || (vb->port == s->port_us))) {
+                dst_port = vb->port;
+            } else {
+                dst_port = s->port_us;
+            }
+        }
 
         // Check send socket
         struct socket_info * client_sock = grep_sock_info(via_host.af == AF_INET ? &ipsec_listen_addr : &ipsec_listen_addr6, src_port, dst_proto);
@@ -867,8 +1066,18 @@ int ipsec_forward(struct sip_msg* m, udomain_t* d, int _cflags)
             dst_port = s->port_us;
         }
     }else{
-        // for Request get the dest proto from the saved contact
-        dst_proto = pcontact->received_proto;
+        if (req->first_line.u.request.method_value == METHOD_REGISTER) {
+            // for Request get the dest proto from the saved contact
+            dst_proto = pcontact->received_proto;
+        } else {
+			if (strstr(m->dst_uri.s, ";transport=tcp") != NULL) {
+				dst_proto = PROTO_TCP;
+			} else if (strstr(m->dst_uri.s, ";transport=tls") != NULL) {
+				dst_proto = PROTO_TLS;
+			} else {
+				dst_proto = m->rcv.proto;
+			}
+        }
 
         // for Request sends from P-CSCF client port
         src_port = s->port_pc;
@@ -877,7 +1086,27 @@ int ipsec_forward(struct sip_msg* m, udomain_t* d, int _cflags)
         dst_port = s->port_us;
     }
 
-    int buf_len = snprintf(buf, sizeof(buf) - 1, "sip:%.*s:%d", ci.via_host.len, ci.via_host.s, dst_port);
+    // Try for send socket
+    struct socket_info * client_sock = grep_sock_info(via_host.af == AF_INET ? &ipsec_listen_addr : &ipsec_listen_addr6, src_port, dst_proto);
+    if(!client_sock && dst_proto == PROTO_UDP) {
+        LM_ERR("UDP socket not found for IPSec forward, trying for TCP\n");
+        dst_proto = PROTO_TCP;
+    }
+
+    int buf_len = 0;
+    if (dst_proto == PROTO_TCP) {
+        buf_len = snprintf(buf, sizeof(buf) - 1, "sip:%.*s:%d;transport=tcp", ci.via_host.len, ci.via_host.s, dst_port);
+    } else if (dst_proto == PROTO_TLS) {
+        buf_len = snprintf(buf, sizeof(buf) - 1, "sip:%.*s:%d;transport=tls", ci.via_host.len, ci.via_host.s, dst_port);
+    } else {
+        buf_len = snprintf(buf, sizeof(buf) - 1, "sip:%.*s:%d", ci.via_host.len, ci.via_host.s, dst_port);
+    }
+
+	if(m->dst_uri.s) {
+		pkg_free(m->dst_uri.s);
+		m->dst_uri.s = NULL;
+		m->dst_uri.len = 0;
+	}
 
     if((m->dst_uri.s = pkg_malloc(buf_len + 1)) == NULL) {
         LM_ERR("Error allocating memory for dst_uri\n");
@@ -889,7 +1118,7 @@ int ipsec_forward(struct sip_msg* m, udomain_t* d, int _cflags)
     m->dst_uri.s[m->dst_uri.len] = '\0';
 
     // Set send socket
-    struct socket_info * client_sock = grep_sock_info(via_host.af == AF_INET ? &ipsec_listen_addr : &ipsec_listen_addr6, src_port, dst_proto);
+    client_sock = grep_sock_info(via_host.af == AF_INET ? &ipsec_listen_addr : &ipsec_listen_addr6, src_port, dst_proto);
     if(!client_sock) {
         LM_ERR("Error calling grep_sock_info() for ipsec client port\n");
         goto cleanup;
@@ -899,10 +1128,15 @@ int ipsec_forward(struct sip_msg* m, udomain_t* d, int _cflags)
    // Set destination info
     struct dest_info dst_info;
     dst_info.send_sock = client_sock;
+#if 1
 	if(m->first_line.type == SIP_REQUEST && (_cflags & IPSEC_SEND_FORCE_SOCKET)){
 		dst_info.send_flags.f |= SND_F_FORCE_SOCKET;
 		m->fwd_send_flags.f |= SND_F_FORCE_SOCKET;
 	}
+#else
+	// commit c08ae85661b35a93bf98d8112982e5fcf7ff1ae8 from https://github.com/herlesupreeth/kamailio
+	set_force_socket(m, client_sock);
+#endif
 #ifdef USE_DNS_FAILOVER
     if (!uri2dst(NULL, &dst_info, m, &m->dst_uri, dst_proto)) {
 #else
@@ -915,14 +1149,14 @@ int ipsec_forward(struct sip_msg* m, udomain_t* d, int _cflags)
     // Update dst_info in message
     if(m->first_line.type == SIP_REPLY) {
         struct cell *t = tmb.t_gett();
-        if (!t) {
+        if (!t || t == (void*) -1) {
             LM_ERR("Error getting transaction\n");
             goto cleanup;
         }
         t->uas.response.dst = dst_info;
     }
 
-	LM_DBG("Destination changed to [%d://%.*s], from [%d:%d]\n", dst_info.proto, m->dst_uri.len, m->dst_uri.s,
+	LM_INFO("Destination changed to [%d://%.*s], from [%d:%d]\n", dst_info.proto, m->dst_uri.len, m->dst_uri.s,
 			dst_info.send_sock->proto, dst_info.send_sock->port_no);
 
     ret = IPSEC_CMD_SUCCESS; // all good, return SUCCESS
@@ -985,7 +1219,7 @@ int ipsec_destroy(struct sip_msg* m, udomain_t* d)
         goto cleanup;
     }
 
-    destroy_ipsec_tunnel(ci.received_host, pcontact->security_temp->data.ipsec, pcontact->contact_port);
+    destroy_ipsec_tunnel(ci.received_host, pcontact->security_temp->data.ipsec, pcontact->contact_port, 1);
 
     ret = IPSEC_CMD_SUCCESS;    // all good, set ret to SUCCESS, and exit
 
@@ -998,6 +1232,62 @@ cleanup:
     return ret;
 }
 
+int ipsec_destroy_by_contact(udomain_t* _d, str * uri, str * received_host, int received_port) {
+
+    pcontact_t* pcontact = NULL;
+    int ret = IPSEC_CMD_FAIL; // FAIL by default
+
+    pcontact_info_t search_ci;
+    memset(&search_ci, 0, sizeof(struct pcontact_info));
+
+    sip_uri_t contact_uri;
+    if (parse_uri(uri->s, uri->len, &contact_uri) != 0) {
+        LM_WARN("Failed to parse aor [%.*s]\n", uri->len, uri->s);
+        return ret;
+    }
+
+    search_ci.received_host.s = received_host->s;
+    search_ci.received_host.len = received_host->len;
+    search_ci.received_port = received_port;
+    search_ci.received_proto = contact_uri.proto? contact_uri.proto : PROTO_UDP;
+    search_ci.searchflag = SEARCH_RECEIVED;
+    search_ci.via_host.s = received_host->s;
+    search_ci.via_host.len = received_host->len;
+    search_ci.via_port = received_port;
+    search_ci.via_prot = search_ci.received_proto;
+    search_ci.aor.s = uri->s;
+    search_ci.aor.len = uri->len;
+    search_ci.reg_state = PCONTACT_ANY;
+
+    if (ul.get_pcontact(_d, &search_ci, &pcontact, 0) != 0 || pcontact==NULL) {
+        LM_ERR("Contact doesn't exist\n");
+        return ret;
+    }
+
+    /* Lock this record while working with the data: */
+    ul.lock_udomain(_d, &pcontact->via_host, pcontact->via_port, pcontact->via_proto);
+
+    if(pcontact->security_temp == NULL) {
+        LM_ERR("No security parameters found in contact\n");
+        goto cleanup;
+    }
+
+    //get security parameters
+    if(pcontact->security_temp->type != SECURITY_IPSEC ) {
+        LM_ERR("Unsupported security type: %d\n", pcontact->security_temp->type);
+        goto cleanup;
+    }
+
+    destroy_ipsec_tunnel(search_ci.received_host, pcontact->security_temp->data.ipsec, pcontact->contact_port, 1);
+
+    ret = IPSEC_CMD_SUCCESS;    // all good, set ret to SUCCESS, and exit
+
+cleanup:
+    /* Unlock domain */
+    ul.unlock_udomain(_d, &pcontact->via_host, pcontact->via_port, pcontact->via_proto);
+    return ret;
+}
+
 int ipsec_reconfig()
 {
 	if(ul.get_number_of_contacts() != 0){
@@ -1005,7 +1295,7 @@ int ipsec_reconfig()
 	}
 
 	clean_spi_list();
-	clean_port_lists();
+	// clean_port_lists();
 
 	LM_DBG("Clean all ipsec tunnels\n");
 
