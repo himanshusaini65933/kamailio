@@ -687,26 +687,40 @@ static int DecodePhoneNumber(char *buffer, int len, str phone)
 static void EncodeTime(char *buffer)
 {
 	time_t ts;
-	struct tm now;
+	struct tm now, local;
 	int i = 0;
+	double timezone_offset_hours;
+	int timezone_offset_encoded;
 
 	time(&ts);
 	/* Get GMT time */
 	gmtime_r(&ts, &now);
+	/* Get local time */
+	localtime_r(&ts, &local);
 
-	i = now.tm_year % 100;
+	/* Calculate timezone offset in hours (and potentially minutes) from GMT */
+	timezone_offset_hours = difftime(mktime(&local), mktime(&now)) / 3600.0;
+
+	/* Here we scale the offset to fit within our encoding range, sacrificing some precision.
+	This approach rounds to the nearest half-hour for known offsets and encodes accordingly. */
+	/* Scale by 4 to account for quarter-hour increments, truncate to int */
+	timezone_offset_encoded = (int)(timezone_offset_hours * 4);
+
+	i = local.tm_year % 100;
 	buffer[0] = (unsigned char)((((i % 10) << 4) | (i / 10)) & 0xff);
-	i = now.tm_mon + 1;
+	i = local.tm_mon + 1;
 	buffer[1] = (unsigned char)((((i % 10) << 4) | (i / 10)) & 0xff);
-	i = now.tm_mday;
+	i = local.tm_mday;
 	buffer[2] = (unsigned char)((((i % 10) << 4) | (i / 10)) & 0xff);
-	i = now.tm_hour;
+	i = local.tm_hour;
 	buffer[3] = (unsigned char)((((i % 10) << 4) | (i / 10)) & 0xff);
-	i = now.tm_min;
+	i = local.tm_min;
 	buffer[4] = (unsigned char)((((i % 10) << 4) | (i / 10)) & 0xff);
-	i = now.tm_sec;
+	i = local.tm_sec;
 	buffer[5] = (unsigned char)((((i % 10) << 4) | (i / 10)) & 0xff);
-	buffer[6] = 0; // Timezone, we use no time offset.
+	/* Timezone offset */
+	i = timezone_offset_encoded;
+	buffer[6] = (unsigned char)((((i % 10) << 4) | (i / 10)) & 0xff);
 }
 
 static void DecodeTime(char *buffer, struct tm *decoded_time)
