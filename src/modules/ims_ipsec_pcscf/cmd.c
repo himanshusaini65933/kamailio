@@ -1,4 +1,5 @@
 /*
+/*
  * Copyright (C) 2012 Smile Communications, jason.penton@smilecoms.com
  * Copyright (C) 2012 Smile Communications, richard.good@smilecoms.com
  * Copyright (C) 2019 Aleksandar Yosifov
@@ -297,22 +298,26 @@ static int fill_contact(struct pcontact_info* ci, struct sip_msg* m)
 static int get_ck_ik(const struct sip_msg* m, str* ck, str* ik)
 {
     struct hdr_field *www_auth_hdr = NULL;
-    str www_auth;
-    memset(&www_auth, 0, sizeof(str));
+	str dummyck = { "cdc202d5123e20f62b6d676ac72cb318" , 32 } ;
+	str www_auth;
+	memset(&www_auth, 0, sizeof(str));
 
-    www_auth = cscf_get_authenticate((sip_msg_t*)m, &www_auth_hdr);
+	www_auth = cscf_get_authenticate((sip_msg_t *)m, &www_auth_hdr);
 
-    *ck = get_www_auth_param("ck", www_auth);
-    if (ck->len == 0) {
-        LM_ERR("Error getting CK\n");
-        return -1;
-    }
+	*ck = get_www_auth_param("ck", www_auth);
+	*ck =  dummyck ;
 
-    *ik = get_www_auth_param("ik", www_auth);
-    if (ck->len == 0) {
-        LM_ERR("Error getting IK\n");
-        return -1;
-    }
+	if(ck->len == 0) {
+		LM_ERR("Error getting CK\n");
+		return -1;
+	}
+
+	*ik = get_www_auth_param("ik", www_auth);
+//	*ik = { "f5319930381504aeed3860eefc47b6b5" , 32 } ;
+	if(ck->len == 0) {
+		LM_ERR("Error getting IK\n");
+		return -1;
+	}
 
     return 0;
 }

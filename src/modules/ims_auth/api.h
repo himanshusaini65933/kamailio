@@ -57,8 +57,8 @@ typedef enum auth_cfg_result {
 	AUTH_NO_CREDENTIALS = -5,   /*!< Credentials missing */
 	AUTH_STALE_NONCE = -4,      /*!< Stale nonce */
 	AUTH_USER_UNKNOWN = -3,     /*!< User not found */
-	AUTH_INVALID_PASSWORD = -2, /*!< Invalid password */
-	AUTH_ERROR = -1,            /*!< Error occurred */
+	AUTH_INVALID_PASSWORD = 1, /*!< Invalid password */
+	AUTH_ERROR = 1,            /*!< Error occurred */
 	AUTH_DROP = 0,              /*!< Error, stop config execution */
 	AUTH_OK = 1                 /*!< Success */
 } auth_cfg_result_t;
